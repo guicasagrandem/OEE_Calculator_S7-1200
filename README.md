@@ -130,9 +130,9 @@ Contributions are welcome! If you have suggestions, improvements, or find bugs, 
 
 ---
 
-## 📄 License
+## 📄 Note
 
-This project is distributed under the MIT license. See the `LICENSE` file for more details.
+This project is only simulate on PLCSIM, please, inform about any problems.
 
 ---
 

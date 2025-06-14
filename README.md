@@ -1,4 +1,4 @@
-OEE Calculator for Siemens S7-1200 in SCL
+#OEE Calculator for Siemens S7-1200 in SCL
 📄 About the Project
 This project implements an OEE (Overall Equipment Effectiveness) Calculator for Siemens SIMATIC S7-1200 PLCs, developed in SCL (Structured Control Language). The goal is to provide a robust and precise solution for monitoring and calculating in real-time the three pillars of OEE: Availability, Performance, and Quality, per work shift.
 

@@ -1,0 +1,434 @@
+// -------------------------------------------------------------------------
+// --- 1. Lógica de Tempo do Sistema e PLC ---
+// Obter data e hora atuais do sistema
+#RET_VAL := RD_SYS_T(OUT => #CurrentDateTime);
+#CurrentTimeOfDay := DTL_TO_TOD(#CurrentDateTime);
+
+
+// --- 1. Lógica de Tempo do Sistema e PLC ---
+// Obter data e hora atuais do sistema
+
+
+// Medir tempo contínuo do PLC (usando TON como um contador de milissegundos)
+// PT alto para não resetar frequentemente o timer. O ET é tipo TIME.
+#Continuous_System_Timer(IN := TRUE,
+                         PT := T#24D_10H,
+                         ET=>#Current_PLC_Time_ms);
+
+
+// --- 2. Conversões de Horários de Turno para Cálculos ---
+#CurrentTimeOfDay_TIME := TOD_TO_TIME(#CurrentTimeOfDay);
+#Shift1_StartTime_TIME := TOD_TO_TIME(#Shift1_StartTime);
+#Shift2_StartTime_TIME := TOD_TO_TIME(#Shift2_StartTime);
+#Shift3_StartTime_TIME := TOD_TO_TIME(#Shift3_StartTime);
+
+#CurrentTimeOfDay_ms := TIME_TO_DINT(#CurrentTimeOfDay_TIME);
+#Shift1_TOD_ms := TIME_TO_DINT(#Shift1_StartTime_TIME);
+#Shift2_TOD_ms := TIME_TO_DINT(#Shift2_StartTime_TIME);
+#Shift3_TOD_ms := TIME_TO_DINT(#Shift3_StartTime_TIME);
+
+
+// --- 3. Detecção do Turno Ativo ---
+#CurrentActiveShift := 0; // Padrão: nenhum turno ativo
+
+IF #CurrentTimeOfDay_ms >= #Shift1_TOD_ms AND #CurrentTimeOfDay_ms < #Shift2_TOD_ms THEN
+    #CurrentActiveShift := 1;
+ELSIF #CurrentTimeOfDay_ms >= #Shift2_TOD_ms AND #CurrentTimeOfDay_ms < #Shift3_TOD_ms THEN
+    #CurrentActiveShift := 2;
+ELSIF #CurrentTimeOfDay_ms >= #Shift3_TOD_ms THEN
+    #CurrentActiveShift := 3;
+ELSE // Se estamos na faixa de 00:00:00 até Shift1_StartTime
+    // Se Shift3_TOD_ms é maior que Shift1_TOD_ms (indica que Turno 3 atravessa a meia-noite)
+    IF #Shift3_TOD_ms > #Shift1_TOD_ms THEN // Ex: T1 06:00, T2 14:00, T3 22:00
+        #CurrentActiveShift := 3; // Considera que ainda estamos no Turno 3 do dia anterior
+    END_IF;
+END_IF;
+
+
+// --- 4. Lógica de Reset e Inicialização Robusta ---
+// Detecção de borda para os inícios de turno e reset manual
+#Edge_Shift1_Start(CLK := (#CurrentTimeOfDay_TIME >= #Shift1_StartTime_TIME) AND (#CurrentTimeOfDay_TIME < (#Shift1_StartTime_TIME + T#1M)));
+#Edge_Shift2_Start(CLK := (#CurrentTimeOfDay_TIME >= #Shift2_StartTime_TIME) AND (#CurrentTimeOfDay_TIME < (#Shift2_StartTime_TIME + T#1M)));
+#Edge_Shift3_Start(CLK := (#CurrentTimeOfDay_TIME >= #Shift3_StartTime_TIME) AND (#CurrentTimeOfDay_TIME < (#Shift3_StartTime_TIME + T#1M)));
+#RisingEdge_ManualReset(CLK := #ResetOEE);
+
+#Internal_ResetTriggered := #RisingEdge_ManualReset.Q OR #Edge_Shift1_Start.Q OR #Edge_Shift2_Start.Q OR #Edge_Shift3_Start.Q;
+
+// Recalcula CalculatedShiftStartMs_Today e IsInsideConfiguredShift para a lógica de reset
+IF #CurrentActiveShift = 1 THEN
+    #IsInsideConfiguredShift := TRUE;
+    #CalculatedShiftStartMs_Today := #Current_PLC_Time_ms - (#CurrentTimeOfDay_ms - #Shift1_TOD_ms);
+ELSIF #CurrentActiveShift = 2 THEN
+    #IsInsideConfiguredShift := TRUE;
+    #CalculatedShiftStartMs_Today := #Current_PLC_Time_ms - (#CurrentTimeOfDay_ms - #Shift2_TOD_ms);
+ELSIF #CurrentActiveShift = 3 THEN
+    #IsInsideConfiguredShift := TRUE;
+    IF #CurrentTimeOfDay_ms >= #Shift3_TOD_ms THEN
+        #CalculatedShiftStartMs_Today := #Current_PLC_Time_ms - (#CurrentTimeOfDay_ms - #Shift3_TOD_ms);
+    ELSE // Se CurrentActiveShift é 3 mas CurrentTimeOfDay_ms está antes de Shift1_TOD_ms (virou o dia)
+        #CalculatedShiftStartMs_Today := #Current_PLC_Time_ms - (#CurrentTimeOfDay_ms + 86400000 - #Shift3_TOD_ms); // 86.400.000 ms = 24 horas
+    END_IF;
+ELSE
+    #IsInsideConfiguredShift := FALSE;
+    #CalculatedShiftStartMs_Today := 0;
+END_IF;
+
+// Lógica de reset e atualização do ShiftActualStartTime_ms (para o OEE geral e disponibilidade)
+IF #FB_FirstScan OR #ShiftActualStartTime_ms = 0 OR #Internal_ResetTriggered THEN
+    IF #IsInsideConfiguredShift THEN
+        #ShiftActualStartTime_ms := #CalculatedShiftStartMs_Today;
+    ELSE
+        #ShiftActualStartTime_ms := 0; // Não estamos em um turno válido para iniciar a contagem de tempo disponível
+    END_IF;
+    
+    IF #Internal_ResetTriggered THEN // Se qualquer condição de reset foi TRUE
+        // Zera TODOS os acumuladores de TODOS os turnos para um novo ciclo de OEE diário/total
+        #TotalDowntime_S1 := 0.0;
+        #TotalCyclesCount_S1 := 0;
+        #ScrapPartsCount_S1 := 0;
+        #GoodPartsCount_S1 := 0;
+        #TotalCycleTimeSum_S1 := 0.0;
+        #CyclesForAverageCount_S1 := 0;
+        #LastCycleTimestamp_S1_ms := 0;
+        #TotalDowntime_S2 := 0.0;
+        #TotalCyclesCount_S2 := 0;
+        #ScrapPartsCount_S2 := 0;
+        #GoodPartsCount_S2 := 0;
+        #TotalCycleTimeSum_S2 := 0.0;
+        #CyclesForAverageCount_S2 := 0;
+        #LastCycleTimestamp_S2_ms := 0;
+        #TotalDowntime_S3 := 0.0;
+        #TotalCyclesCount_S3 := 0;
+        #ScrapPartsCount_S3 := 0;
+        #GoodPartsCount_S3 := 0;
+        #TotalCycleTimeSum_S3 := 0.0;
+        #CyclesForAverageCount_S3 := 0;
+        #LastCycleTimestamp_S3_ms := 0;
+        
+        #Downtime_StartTime_Stamp_ms := 0; // Garante que a contagem de downtime comece do zero
+        #LastResetTimestamp_ms := #Current_PLC_Time_ms; // Grava o momento do reset
+    END_IF;
+    #FB_FirstScan := FALSE; // Desabilita o first scan após a primeira execução
+END_IF;
+
+// Ajuste contínuo de ShiftActualStartTime_ms para casos onde o PLC ligou no meio do turno
+IF #ShiftActualStartTime_ms > 0 AND #IsInsideConfiguredShift THEN
+   
+    
+    CASE #CurrentActiveShift OF
+        1:
+            #ExpectedElapsedTimeSinceShiftStart_ms_FromTOD := #CurrentTimeOfDay_ms - #Shift1_TOD_ms;
+        2:
+            #ExpectedElapsedTimeSinceShiftStart_ms_FromTOD := #CurrentTimeOfDay_ms - #Shift2_TOD_ms;
+        3: // Handling for Shift 3 across midnight
+            IF #CurrentTimeOfDay_ms >= #Shift3_TOD_ms THEN
+                #ExpectedElapsedTimeSinceShiftStart_ms_FromTOD := #CurrentTimeOfDay_ms - #Shift3_TOD_ms;
+            ELSE // Current time is after midnight, but before Shift1 (Still Shift 3 from previous day)
+                #ExpectedElapsedTimeSinceShiftStart_ms_FromTOD := #CurrentTimeOfDay_ms + 86400000 - #Shift3_TOD_ms; // 86.400.000 ms = 24 horas
+            END_IF;
+        ELSE
+            #ExpectedElapsedTimeSinceShiftStart_ms_FromTOD := 0; // Should not happen if IsInsideConfiguredShift is TRUE
+    END_CASE;
+    
+    // Se o tempo acumulado no ShiftActualStartTime_ms é muito maior do que deveria ser
+    IF DINT_TO_LREAL(#Current_PLC_Time_ms - #ShiftActualStartTime_ms) > (DINT_TO_LREAL(#ExpectedElapsedTimeSinceShiftStart_ms_FromTOD) + 1000.0) THEN // Adiciona 1 segundo de tolerância
+        #ShiftActualStartTime_ms := #CalculatedShiftStartMs_Today; // Ajusta para o início "real" do turno atual
+    END_IF;
+END_IF;
+
+
+// --- 5. Lógica de Medição de Tempo e Contagem ---
+// Ativa os R_TRIGs e F_TRIG para detecção de borda
+#RisingEdge_CycleCompleted(CLK := #CycleCompleted);
+#RisingEdge_ScrapPart_ON(CLK := #ScrapPart);
+
+// Lógica consolidada de Downtime
+// A máquina está "down" (inativa) se estiver em Fault_ON OU NÃO estiver em Auto_ON.
+#IsMachineDown := #Fault_ON OR (NOT #Auto_ON);
+
+#R_TRIG_Downtime_Start(CLK := #IsMachineDown);
+#F_TRIG_Downtime_End(CLK := #IsMachineDown);
+
+// Direciona a acumulação para o conjunto de variáveis do turno ativo
+CASE #CurrentActiveShift OF
+    1: // --- TURNO 1 LÓGICA DE ACUMULAÇÃO ---
+        // Medir tempo de downtime (inclui falha ou não em automático)
+        IF #R_TRIG_Downtime_Start.Q THEN
+            #Downtime_StartTime_Stamp_ms := #Current_PLC_Time_ms;
+        ELSIF #F_TRIG_Downtime_End.Q AND #Downtime_StartTime_Stamp_ms > 0 THEN
+            #TotalDowntime_S1 := #TotalDowntime_S1 + DINT_TO_LREAL(#Current_PLC_Time_ms - #Downtime_StartTime_Stamp_ms) / 1000.0;
+            #Downtime_StartTime_Stamp_ms := 0; // Zera para próxima contagem
+        END_IF;
+        // Acumula continuamente enquanto a máquina está em estado de inatividade
+        IF #IsMachineDown AND #Downtime_StartTime_Stamp_ms > 0 THEN
+            #TotalDowntime_S1 := #TotalDowntime_S1 + DINT_TO_LREAL(#Current_PLC_Time_ms - #Downtime_StartTime_Stamp_ms) / 1000.0;
+            #Downtime_StartTime_Stamp_ms := #Current_PLC_Time_ms; // Atualiza timestamp para a próxima varredura
+        END_IF;
+        
+        // Contagem de ciclos e tempo de ciclo médio
+        IF #RisingEdge_CycleCompleted.Q THEN
+            #TotalCyclesCount_S1 := #TotalCyclesCount_S1 + 1;
+            IF #LastCycleTimestamp_S1_ms > 0 THEN
+                #TotalCycleTimeSum_S1 := #TotalCycleTimeSum_S1 + DINT_TO_LREAL(#Current_PLC_Time_ms - #LastCycleTimestamp_S1_ms) / 1000.0;
+                #CyclesForAverageCount_S1 := #CyclesForAverageCount_S1 + 1;
+            END_IF;
+            #LastCycleTimestamp_S1_ms := #Current_PLC_Time_ms;
+        END_IF;
+        
+        // Contagem de refugo
+        IF #RisingEdge_ScrapPart_ON.Q THEN
+            #ScrapPartsCount_S1 := #ScrapPartsCount_S1 + 1;
+        END_IF;
+        #GoodPartsCount_S1 := #TotalCyclesCount_S1 - #ScrapPartsCount_S1;
+        
+    2: // --- TURNO 2 LÓGICA DE ACUMULAÇÃO ---
+        // Medir tempo de downtime (inclui falha ou não em automático)
+        IF #R_TRIG_Downtime_Start.Q THEN
+            #Downtime_StartTime_Stamp_ms := #Current_PLC_Time_ms;
+        ELSIF #F_TRIG_Downtime_End.Q AND #Downtime_StartTime_Stamp_ms > 0 THEN
+            #TotalDowntime_S2 := #TotalDowntime_S2 + DINT_TO_LREAL(#Current_PLC_Time_ms - #Downtime_StartTime_Stamp_ms) / 1000.0;
+            #Downtime_StartTime_Stamp_ms := 0;
+        END_IF;
+        IF #IsMachineDown AND #Downtime_StartTime_Stamp_ms > 0 THEN
+            #TotalDowntime_S2 := #TotalDowntime_S2 + DINT_TO_LREAL(#Current_PLC_Time_ms - #Downtime_StartTime_Stamp_ms) / 1000.0;
+            #Downtime_StartTime_Stamp_ms := #Current_PLC_Time_ms;
+        END_IF;
+        
+        // Contagem de ciclos e tempo de ciclo
+        IF #RisingEdge_CycleCompleted.Q THEN
+            #TotalCyclesCount_S2 := #TotalCyclesCount_S2 + 1;
+            IF #LastCycleTimestamp_S2_ms > 0 THEN
+                #TotalCycleTimeSum_S2 := #TotalCycleTimeSum_S2 + DINT_TO_LREAL(#Current_PLC_Time_ms - #LastCycleTimestamp_S2_ms) / 1000.0;
+                #CyclesForAverageCount_S2 := #CyclesForAverageCount_S2 + 1;
+            END_IF;
+            #LastCycleTimestamp_S2_ms := #Current_PLC_Time_ms;
+        END_IF;
+        
+        // Contagem de refugo
+        IF #RisingEdge_ScrapPart_ON.Q THEN
+            #ScrapPartsCount_S2 := #ScrapPartsCount_S2 + 1;
+        END_IF;
+        #GoodPartsCount_S2 := #TotalCyclesCount_S2 - #ScrapPartsCount_S2;
+        
+    3: // --- TURNO 3 LÓGICA DE ACUMULAÇÃO ---
+        // Medir tempo de downtime (inclui falha ou não em automático)
+        IF #R_TRIG_Downtime_Start.Q THEN
+            #Downtime_StartTime_Stamp_ms := #Current_PLC_Time_ms;
+        ELSIF #F_TRIG_Downtime_End.Q AND #Downtime_StartTime_Stamp_ms > 0 THEN
+            #TotalDowntime_S3 := #TotalDowntime_S3 + DINT_TO_LREAL(#Current_PLC_Time_ms - #Downtime_StartTime_Stamp_ms) / 1000.0;
+            #Downtime_StartTime_Stamp_ms := 0;
+        END_IF;
+        IF #IsMachineDown AND #Downtime_StartTime_Stamp_ms > 0 THEN
+            #TotalDowntime_S3 := #TotalDowntime_S3 + DINT_TO_LREAL(#Current_PLC_Time_ms - #Downtime_StartTime_Stamp_ms) / 1000.0;
+            #Downtime_StartTime_Stamp_ms := #Current_PLC_Time_ms;
+        END_IF;
+        
+        // Contagem de ciclos e tempo de ciclo
+        IF #RisingEdge_CycleCompleted.Q THEN
+            #TotalCyclesCount_S3 := #TotalCyclesCount_S3 + 1;
+            IF #LastCycleTimestamp_S3_ms > 0 THEN
+                #TotalCycleTimeSum_S3 := #TotalCycleTimeSum_S3 + DINT_TO_LREAL(#Current_PLC_Time_ms - #LastCycleTimestamp_S3_ms) / 1000.0;
+                #CyclesForAverageCount_S3 := #CyclesForAverageCount_S3 + 1;
+            END_IF;
+            #LastCycleTimestamp_S3_ms := #Current_PLC_Time_ms;
+        END_IF;
+        
+        // Contagem de sucata
+        IF #RisingEdge_ScrapPart_ON.Q THEN
+            #ScrapPartsCount_S3 := #ScrapPartsCount_S3 + 1;
+        END_IF;
+        #GoodPartsCount_S3 := #TotalCyclesCount_S3 - #ScrapPartsCount_S3;
+        
+    ELSE // CurrentActiveShift = 0 (Nenhum turno ativo - não acumula)
+        // Não há lógica de acumulação quando não há turno ativo.
+        // É importante resetar o Downtime_StartTime_Stamp_ms aqui para evitar contagem indevida
+        // caso a máquina entre em downtime fora de um turno configurado e depois um turno se inicie.
+        #Downtime_StartTime_Stamp_ms := 0;
+END_CASE;
+
+
+// --- 6. Cálculo do OEE e Componentes para CADA TURNO (S1, S2, S3) ---
+
+// --- CÁLCULO PARA OEE DO TURNO 1 ---
+// Performance_Shift1
+IF #CyclesForAverageCount_S1 > 0 AND #TotalCycleTimeSum_S1 > 0.0 THEN
+    #CurrentCycleTime_Temp := #TotalCycleTimeSum_S1 / LREAL_TO_REAL(#CyclesForAverageCount_S1);
+    #Performance_Shift1 := (#StandardCycleTime / #CurrentCycleTime_Temp) * 100.0;
+    IF #Performance_Shift1 > 100.0 THEN
+        #Performance_Shift1 := 100.0;
+    END_IF;
+ELSE
+    #Performance_Shift1 := 0.0;
+END_IF;
+
+// Quality_Shift1
+IF #TotalCyclesCount_S1 > 0 THEN
+    #Quality_Shift1 := (LREAL_TO_REAL(#GoodPartsCount_S1) / LREAL_TO_REAL(#TotalCyclesCount_S1)) * 100.0;
+ELSE
+    #Quality_Shift1 := 0.0;
+END_IF;
+
+// Availability_Shift1 (Calcula o tempo disponível do turno 1)
+#TotalTimeForOEE_Calc := 0.0;
+IF #CurrentTimeOfDay_ms >= #Shift1_TOD_ms THEN // Se o Turno 1 já deveria ter começado hoje
+    IF #CurrentTimeOfDay_ms < #Shift2_TOD_ms THEN // Se o Turno 1 ainda está ativo
+        // Tempo desde o início do turno até agora
+        #TotalTimeForOEE_Calc := DINT_TO_LREAL(#Current_PLC_Time_ms - #ShiftActualStartTime_ms) / 1000.0; // Usa ShiftActualStartTime_ms para maior precisão
+    ELSE // Turno 1 já passou (a hora atual está no turno 2 ou 3)
+        // Tempo total de duração do turno 1 (do Shift1_StartTime até o Shift2_StartTime)
+        #TotalTimeForOEE_Calc := DINT_TO_LREAL(#Shift2_TOD_ms - #Shift1_TOD_ms) / 1000.0;
+    END_IF;
+END_IF;
+
+IF #TotalTimeForOEE_Calc > 0.0 THEN
+   
+    #RealOperatingTime_S1 := #TotalTimeForOEE_Calc - #TotalDowntime_S1;
+    IF #RealOperatingTime_S1 < 0.0 THEN
+        #RealOperatingTime_S1 := 0.0;
+    END_IF; // Evita valores negativos
+    
+    #Availability_Shift1 := (#RealOperatingTime_S1 / #TotalTimeForOEE_Calc) * 100.0;
+    IF #Availability_Shift1 > 100.0 THEN
+        #Availability_Shift1 := 100.0;
+    END_IF;
+ELSE
+    #Availability_Shift1 := 0.0;
+END_IF;
+
+// OEE_Shift1
+#OEE_Shift1 := (#Availability_Shift1 / 100.0) * (#Performance_Shift1 / 100.0) * (#Quality_Shift1 / 100.0) * 100.0;
+
+
+// --- CÁLCULO PARA OEE DO TURNO 2 ---
+// Performance_Shift2
+IF #CyclesForAverageCount_S2 > 0 AND #TotalCycleTimeSum_S2 > 0.0 THEN
+    #CurrentCycleTime_Temp := #TotalCycleTimeSum_S2 / LREAL_TO_REAL(#CyclesForAverageCount_S2);
+    #Performance_Shift2 := (#StandardCycleTime / #CurrentCycleTime_Temp) * 100.0;
+    IF #Performance_Shift2 > 100.0 THEN
+        #Performance_Shift2 := 100.0;
+    END_IF;
+ELSE
+    #Performance_Shift2 := 0.0;
+END_IF;
+
+// Quality_Shift2
+IF #TotalCyclesCount_S2 > 0 THEN
+    #Quality_Shift2 := (LREAL_TO_REAL(#GoodPartsCount_S2) / LREAL_TO_REAL(#TotalCyclesCount_S2)) * 100.0;
+ELSE
+    #Quality_Shift2 := 0.0;
+END_IF;
+
+// Availability_Shift2
+#TotalTimeForOEE_Calc := 0.0;
+IF #CurrentTimeOfDay_ms >= #Shift2_TOD_ms THEN // Se o Turno 2 já deveria ter começado hoje
+    IF #CurrentTimeOfDay_ms < #Shift3_TOD_ms THEN // Se o Turno 2 ainda está ativo
+        #TotalTimeForOEE_Calc := DINT_TO_LREAL(#Current_PLC_Time_ms - #ShiftActualStartTime_ms) / 1000.0; // Usa ShiftActualStartTime_ms
+    ELSE // Turno 2 já passou
+        #TotalTimeForOEE_Calc := DINT_TO_LREAL(#Shift3_TOD_ms - #Shift2_TOD_ms) / 1000.0;
+    END_IF;
+END_IF;
+IF #TotalTimeForOEE_Calc > 0.0 THEN
+    
+    #RealOperatingTime_S2 := #TotalTimeForOEE_Calc - #TotalDowntime_S2;
+    IF #RealOperatingTime_S2 < 0.0 THEN
+        #RealOperatingTime_S2 := 0.0;
+    END_IF;
+    
+    #Availability_Shift2 := (#RealOperatingTime_S2 / #TotalTimeForOEE_Calc) * 100.0;
+    IF #Availability_Shift2 > 100.0 THEN
+        #Availability_Shift2 := 100.0;
+    END_IF;
+ELSE
+    #Availability_Shift2 := 0.0;
+END_IF;
+
+// OEE_Shift2
+#OEE_Shift2 := (#Availability_Shift2 / 100.0) * (#Performance_Shift2 / 100.0) * (#Quality_Shift2 / 100.0) * 100.0;
+
+
+// --- CÁLCULO PARA OEE DO TURNO 3 ---
+// Performance_Shift3
+IF #CyclesForAverageCount_S3 > 0 AND #TotalCycleTimeSum_S3 > 0.0 THEN
+    #CurrentCycleTime_Temp := #TotalCycleTimeSum_S3 / LREAL_TO_REAL(#CyclesForAverageCount_S3);
+    #Performance_Shift3 := (#StandardCycleTime / #CurrentCycleTime_Temp) * 100.0;
+    IF #Performance_Shift3 > 100.0 THEN
+        #Performance_Shift3 := 100.0;
+    END_IF;
+ELSE
+    #Performance_Shift3 := 0.0;
+END_IF;
+
+// Quality_Shift3
+IF #TotalCyclesCount_S3 > 0 THEN
+    #Quality_Shift3 := (LREAL_TO_REAL(#GoodPartsCount_S3) / LREAL_TO_REAL(#TotalCyclesCount_S3)) * 100.0;
+ELSE
+    #Quality_Shift3 := 0.0;
+END_IF;
+
+// Availability_Shift3 (considera a virada de dia)
+#TotalTimeForOEE_Calc := 0.0;
+IF #CurrentTimeOfDay_ms >= #Shift3_TOD_ms THEN // Se o Turno 3 começou hoje (e ainda não virou o dia)
+    #TotalTimeForOEE_Calc := DINT_TO_LREAL(#Current_PLC_Time_ms - #ShiftActualStartTime_ms) / 1000.0; // Usa ShiftActualStartTime_ms
+ELSIF #CurrentTimeOfDay_ms < #Shift1_TOD_ms THEN // Se estamos na madrugada (entre 00:00 e Shift1_StartTime)
+    // Assume que ainda é parte do Turno 3 que começou no dia anterior
+    #TotalTimeForOEE_Calc := DINT_TO_LREAL(#Current_PLC_Time_ms - #ShiftActualStartTime_ms) / 1000.0; // Usa ShiftActualStartTime_ms
+END_IF;
+IF #TotalTimeForOEE_Calc > 0.0 THEN
+   
+    #RealOperatingTime_S3 := #TotalTimeForOEE_Calc - #TotalDowntime_S3;
+    IF #RealOperatingTime_S3 < 0.0 THEN
+        #RealOperatingTime_S3 := 0.0;
+    END_IF;
+    
+    #Availability_Shift3 := (#RealOperatingTime_S3 / #TotalTimeForOEE_Calc) * 100.0;
+    IF #Availability_Shift3 > 100.0 THEN
+        #Availability_Shift3 := 100.0;
+    END_IF;
+ELSE
+    #Availability_Shift3 := 0.0;
+END_IF;
+
+// OEE_Shift3
+#OEE_Shift3 := (#Availability_Shift3 / 100.0) * (#Performance_Shift3 / 100.0) * (#Quality_Shift3 / 100.0) * 100.0;
+
+
+// --- 7. Atribuição das Saídas Gerais do FB (Refletem o Turno Ativo) ---
+// Estas saídas exibirão o OEE e componentes do turno que está rodando AGORA.
+CASE #CurrentActiveShift OF
+    1:
+        #OEE_Perc := #OEE_Shift1;
+        #Availability_Perc := #Availability_Shift1;
+        #Performance_Perc := #Performance_Shift1;
+        #Quality_Perc := #Quality_Shift1;
+        IF #CyclesForAverageCount_S1 > 0 AND #TotalCycleTimeSum_S1 > 0.0 THEN
+            #AverageCycleTime := #TotalCycleTimeSum_S1 / LREAL_TO_REAL(#CyclesForAverageCount_S1);
+        ELSE
+            #AverageCycleTime := 0.0;
+        END_IF;
+    2:
+        #OEE_Perc := #OEE_Shift2;
+        #Availability_Perc := #Availability_Shift2;
+        #Performance_Perc := #Performance_Shift2;
+        #Quality_Perc := #Quality_Shift2;
+        IF #CyclesForAverageCount_S2 > 0 AND #TotalCycleTimeSum_S2 > 0.0 THEN
+            #AverageCycleTime := #TotalCycleTimeSum_S2 / LREAL_TO_REAL(#CyclesForAverageCount_S2);
+        ELSE
+            #AverageCycleTime := 0.0;
+        END_IF;
+    3:
+        #OEE_Perc := #OEE_Shift3;
+        #Availability_Perc := #Availability_Shift3;
+        #Performance_Perc := #Performance_Shift3;
+        #Quality_Perc := #Quality_Shift3;
+        IF #CyclesForAverageCount_S3 > 0 AND #TotalCycleTimeSum_S3 > 0.0 THEN
+            #AverageCycleTime := #TotalCycleTimeSum_S3 / LREAL_TO_REAL(#CyclesForAverageCount_S3);
+        ELSE
+            #AverageCycleTime := 0.0;
+        END_IF;
+    ELSE // CurrentActiveShift = 0 (nenhum turno configurado ativo ou período de transição)
+        #OEE_Perc := 0.0;
+        #Availability_Perc := 0.0;
+        #Performance_Perc := 0.0;
+        #Quality_Perc := 0.0;
+        #AverageCycleTime := 0.0;
+END_CASE;
